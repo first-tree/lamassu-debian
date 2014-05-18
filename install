@@ -34,30 +34,38 @@ function initscript() {
 # Provides:          $package
 # Required-Start:    \$remote_fs
 # Required-Stop:     \$remote_fs
-# Default-Start:     S
-# Default-Stop:      
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
 # Short-Description: $package
 # Description:       Lamassu.is Operator Server
 ### END INIT INFO
 
 export DATABASE_URL=postgres://lamassu:$password@localhost/lamassu
 export NODE_ENV=production
+export LAMASSU_ENV=production
+#For debugging, uncomment the following lines:
+#export NODE_ENV=debug
+#export LAMASSU_ENV=debug
+#CLOSE=--no-close
 PIDFILE=/var/run/$package.pid
 DAEMON=/usr/local/bin/$package
-DAEMON_OPTS="--key /root/$package.key --cert /root/$package.crt"
+DAEMON_OPTS="--key $userhome/$package.key --cert $userhome/$package.crt"
+NAME=node
+USER=lamassu
+GROUP=lamassu
 
 [ -x \$DAEMON ] || exit 0
 
 case "\$1" in
         start)
                 echo -n "Starting $package: "
-                start-stop-daemon --start --quiet --pidfile \$PIDFILE --name $package --background --chdir $(npm -g explore $package pwd) --exec \$DAEMON -- \$DAEMON_OPTS
+                start-stop-daemon --start --quiet --pidfile \$PIDFILE --name \$NAME --user \$USER \$CLOSE --chuid \$USER:\$GROUP --background --make-pidfile --chdir $(npm -g explore $package pwd) --exec \$DAEMON -- \$DAEMON_OPTS
                 echo "done."
 
         ;;
         stop)
                 echo -n "Stopping $package: "
-                start-stop-daemon --stop --quiet --pidfile \$PIDFILE --name $package 
+                start-stop-daemon --stop --quiet --pidfile \$PIDFILE --name \$NAME --user \$USER
                 echo "done."
         ;;
         restart|reload|force-reload)
@@ -69,7 +77,6 @@ EOF
 
   chmod 0700 "/etc/init.d/$package"
 }
-
 
 function prompt() {
   question="$1"
@@ -105,6 +112,7 @@ if [ "$(whoami)" != "root" ]; then
   exit 3
 fi
 
+installuser="root"
 debug="lamassu-debug.log"
 prefix="/usr/local"
 arch=`uname -m`
@@ -124,7 +132,7 @@ rm -f lamassu-debug.log
 
 if exists apt-get; then
   update="apt-get update -y"
-  upgrade="apt-get upgrade -y"
+  upgrade="apt-get upgrade -y; apt-get install curl -y"
   install="
     echo \"deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -c | awk '{print $2}')-pgdg main\" > /etc/apt/sources.list.d/pgdg.list &&
     curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - &&
@@ -148,7 +156,7 @@ if exists start && [ -d "/etc/init" ]; then
   service="upstart"
 fi
 
-if exists /usr/sbin/update-rc.d; then
+if exists update-rc.d; then
   service="debian_sysv-rc"
 fi
 
@@ -166,6 +174,9 @@ echo "Pick your admin panel credentials:"
 prompt "Username" "admin" false admin_username
 prompt "Password" "" true admin_password
 
+if [ -z "$admin_password" ]; then
+  fail "Admin password cannot be blank"
+fi
 
 echo
 echo "Updating your system (this might take a while)..."
@@ -174,8 +185,12 @@ eval $update >> $debug 2>&1 || fail "Updating your system failed"
 eval $upgrade >> $debug 2>&1 || fail "Updating your system failed"
 
 # Install PostgreSQL with the package manager we found.
-echo
-echo "Installing PostgreSQL (this might take a while)..."
+if exists curl; then
+  echo
+  echo "Installing PostgreSQL (this might take a while)..."
+else
+  fail "Curl is required; apt-get install curl"
+fi
 eval $install >> $debug 2>&1 || fail "PostgreSQL installation failed"
 
 # Set up users and databases in Postgres.
@@ -200,6 +215,42 @@ echo "Installing Lamassu stack (this might take a while)..."
 
 npm -g install lamassu-server lamassu-admin lamassu-scripts >> $debug 2>&1 || fail "Lamassu stack installation failed"
 
+# Bootstrap lamassu database
+# We also have to use `-h 127.0.0.1` because the default type of authentication
+# for `local` connection is `peer`, which checks username of the user running
+# `psql` command.
+echo "Bootstrapping PostgreSQL..."
+SQL_FILE="$(npm -g root)/lamassu-scripts/database/lamassu.sql"
+
+if [ -x /usr/sbin/adduser ]; then
+  # Add lamassu system account to run daemon and connect to DB as
+  echo "Adding lamassu user..."
+  /usr/sbin/adduser lamassu --disabled-password --disabled-login >> $debug 2>&1 < /dev/null || true
+  installuser="lamassu"
+  PGPASSWORD="$password" su -c "psql -h 127.0.0.1 lamassu lamassu" $installuser >> $debug 2>&1 < $SQL_FILE || fail "Bootstrapping PostgreSQL as lamassu system user"
+else
+  PGPASSWORD="$password" psql -h 127.0.0.1 lamassu lamassu >> $debug 2>&1 < $SQL_FILE ||
+    ( echo "Could not connect to PostgreSQL as lamassu user.\nTry adding the following line to the beginning of your pg_hba.conf:"
+      echo "host lamassu lamassu 127.0.0.1 255.255.255.255 trust"
+      fail "Bootstrapping PostgreSQL failed" )
+fi
+
+echo "Creating a Lamassu user account"
+DATABASE_URL="postgres://lamassu:$password@localhost/lamassu" lamassu-useradd "$admin_username" "$admin_password" || fail "Adding a user failed"
+
+ip=$(ifconfig eth0 | grep "inet addr" | awk -F: '{print $2}' | awk '{print $1}')
+
+userhome=`su - -c pwd $installuser`
+
+# Generate SSL certificates for lamassu-server and lamassu-admin.
+echo "Generating SSL certificates..."
+openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:8081" -keyout $userhome/lamassu-admin.key  -out $userhome/lamassu-admin.crt >> $debug 2>&1 || fail "Generating a certificate for lamassu-admin failed"
+
+openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:3000" -keyout $userhome/lamassu-server.key -out $userhome/lamassu-server.crt >> $debug 2>&1 || fail "Generating a certificate for lamassu-server failed"
+
+chown $installuser $userhome/{*.key,*.crt}
+chmod 600 $userhome/{*.key,*.crt}
+
 echo "Installing Lamassu services..."
 if [ "$service" == "upstart" ]; then
   upstart "lamassu-server"
@@ -210,30 +261,6 @@ elif [ "$service" == "debian_sysv-rc" ]; then
   update-rc.d lamassu-server defaults || fail "Initscript enabling failed"
   update-rc.d lamassu-admin defaults || fail "Initscript enabling failed"
 fi
-
-# Bootstrap lamassu database
-# We also have to use `-h 127.0.0.1` because the default type of authentication
-# for `local` connection is `peer`, which checks username of the user running
-# `psql` command.
-echo "Bootstrapping PostgreSQL..."
-SQL_FILE="$(npm -g root)/lamassu-scripts/database/lamassu.sql"
-PGPASSWORD="$password" psql -h 127.0.0.1 lamassu lamassu >> $debug 2>&1 < $SQL_FILE ||
-	( echo "Could not connect to PostgreSQL as lamassu user.\nTry adding the following line to the beginning of your pg_hba.conf:"
-	  echo "host lamassu lamassu 127.0.0.1 255.255.255.255 trust"
-	  fail "Bootstrapping PostgreSQL failed" )
-
-echo "Creating a Lamassu user account"
-DATABASE_URL="postgres://lamassu:$password@localhost/lamassu" lamassu-useradd "$admin_username" "$admin_password" || fail "Adding a user failed"
-
-ip=$(ifconfig eth0 | grep "inet addr" | awk -F: '{print $2}' | awk '{print $1}')
-
-# Generate SSL certificates for lamassu-server and lamassu-admin.
-echo "Generating SSL certificates..."
-openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:8081" -keyout /root/lamassu-admin.key  -out /root/lamassu-admin.crt >> $debug 2>&1 || fail "Generating a certificate for lamassu-admin failed"
-
-openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:3000" -keyout /root/lamassu-server.key -out /root/lamassu-server.crt >> $debug 2>&1 || fail "Generating a certificate for lamassu-server failed"
-
-chmod 600 /root/{*.key,*.crt}
 
 echo "Starting Lamassu services..."
 if [ "$service" == "upstart" ]; then
