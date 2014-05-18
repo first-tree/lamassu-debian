@@ -25,6 +25,52 @@ chdir $(npm -g explore $package pwd)
 EOF
 }
 
+function initscript() {
+  package="$1"
+
+  cat > "/etc/init.d/$package" <<EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          $package
+# Required-Start:    \$remote_fs
+# Required-Stop:     \$remote_fs
+# Default-Start:     S
+# Default-Stop:      
+# Short-Description: $package
+# Description:       Lamassu.is Operator Server
+### END INIT INFO
+
+export DATABASE_URL=postgres://lamassu:$password@localhost/lamassu
+export NODE_ENV=production
+PIDFILE=/var/run/$package.pid
+DAEMON=/usr/local/bin/$package
+DAEMON_OPTS="--key /root/$package.key --cert /root/$package.crt"
+
+[ -x \$DAEMON ] || exit 0
+
+case "\$1" in
+        start)
+                echo -n "Starting $package: "
+                start-stop-daemon --start --quiet --pidfile \$PIDFILE --name $package --background --chdir $(npm -g explore $package pwd) --exec \$DAEMON -- \$DAEMON_OPTS
+                echo "done."
+
+        ;;
+        stop)
+                echo -n "Stopping $package: "
+                start-stop-daemon --stop --quiet --pidfile \$PIDFILE --name $package 
+                echo "done."
+        ;;
+        restart|reload|force-reload)
+                \$0 stop
+                \$0 start
+        ;;
+esac
+EOF
+
+  chmod 0700 "/etc/init.d/$package"
+}
+
+
 function prompt() {
   question="$1"
   default="$2"
@@ -61,7 +107,14 @@ fi
 
 debug="lamassu-debug.log"
 prefix="/usr/local"
-node="http://nodejs.org/dist/v0.10.26/node-v0.10.26-linux-x64.tar.gz"
+arch=`uname -m`
+case $arch in
+	x86_64)
+		arch=x64;;
+	i686)
+		arch=x86;;
+esac
+node="http://nodejs.org/dist/v0.10.26/node-v0.10.26-linux-$arch.tar.gz"
 
 # First detect our package manager. Fail early if we don't support it.
 update=""
@@ -95,9 +148,13 @@ if exists start && [ -d "/etc/init" ]; then
   service="upstart"
 fi
 
+if exists /usr/sbin/update-rc.d; then
+  service="debian_sysv-rc"
+fi
+
 if [ -z "$service" ]; then
   echo "Your service manager isn't supported"
-  echo "This script currently supports upstart"
+  echo "This script currently supports upstart and debian_sysv-rc"
   exit 2
 fi
 
@@ -113,17 +170,13 @@ prompt "Password" "" true admin_password
 echo
 echo "Updating your system (this might take a while)..."
 
-eval $update >> $debug 2>&1
-eval $upgrade >> $debug 2>&1
-
-[ $? -ne 0 ] && fail "Updating your system failed"
+eval $update >> $debug 2>&1 || fail "Updating your system failed"
+eval $upgrade >> $debug 2>&1 || fail "Updating your system failed"
 
 # Install PostgreSQL with the package manager we found.
 echo
 echo "Installing PostgreSQL (this might take a while)..."
-eval $install >> $debug 2>&1
-
-[ $? -ne 0 ] && fail "PostgreSQL installation failed"
+eval $install >> $debug 2>&1 || fail "PostgreSQL installation failed"
 
 # Set up users and databases in Postgres.
 # Remark: do we want lamassu to be a super user?
@@ -140,20 +193,22 @@ echo "{\"postgresql\":\"postgres://lamassu:$password@localhost/lamassu\"}" > /et
 echo "Fetching and installing node.js..."
 
 # Install node in $prefix
-curl "$node" | tar -C"$prefix" --strip-components=1 -zxf-
-
-[ $? -ne 0 ] && fail "Node.js installation failed"
+curl "$node" 2>> $debug| tar -C"$prefix" --strip-components=1 -zxf- || fail "Node.js installation failed"
 
 echo "Installing Lamassu stack (this might take a while)..."
 # Install Lamassu stack
 
-npm -g install lamassu-server lamassu-admin lamassu-scripts >> $debug 2>&1
-[ $? -ne 0 ] && fail "Lamassu stack installation failed"
+npm -g install lamassu-server lamassu-admin lamassu-scripts >> $debug 2>&1 || fail "Lamassu stack installation failed"
 
 echo "Installing Lamassu services..."
 if [ "$service" == "upstart" ]; then
   upstart "lamassu-server"
   upstart "lamassu-admin"
+elif [ "$service" == "debian_sysv-rc" ]; then
+  initscript "lamassu-server"
+  initscript "lamassu-admin"
+  update-rc.d lamassu-server defaults || fail "Initscript enabling failed"
+  update-rc.d lamassu-admin defaults || fail "Initscript enabling failed"
 fi
 
 # Bootstrap lamassu database
@@ -162,32 +217,32 @@ fi
 # `psql` command.
 echo "Bootstrapping PostgreSQL..."
 SQL_FILE="$(npm -g root)/lamassu-scripts/database/lamassu.sql"
-PGPASSWORD="$password" psql -h 127.0.0.1 lamassu lamassu >> $debug 2>&1 < $SQL_FILE
-
-[ $? -ne 0 ] && fail "Bootstrapping PostgreSQL failed"
+PGPASSWORD="$password" psql -h 127.0.0.1 lamassu lamassu >> $debug 2>&1 < $SQL_FILE ||
+	( echo "Could not connect to PostgreSQL as lamassu user.\nTry adding the following line to the beginning of your pg_hba.conf:"
+	  echo "host lamassu lamassu 127.0.0.1 255.255.255.255 trust"
+	  fail "Bootstrapping PostgreSQL failed" )
 
 echo "Creating a Lamassu user account"
-DATABASE_URL="postgres://lamassu:$password@localhost/lamassu" lamassu-useradd "$admin_username" "$admin_password"
-[ $? -ne 0 ] && fail "Adding a user failed"
+DATABASE_URL="postgres://lamassu:$password@localhost/lamassu" lamassu-useradd "$admin_username" "$admin_password" || fail "Adding a user failed"
 
 ip=$(ifconfig eth0 | grep "inet addr" | awk -F: '{print $2}' | awk '{print $1}')
 
 # Generate SSL certificates for lamassu-server and lamassu-admin.
 echo "Generating SSL certificates..."
-openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:8081" -keyout /root/lamassu-admin.key  -out /root/lamassu-admin.crt >> $debug 2>&1
-[ $? -ne 0 ] && fail "Generating a certificate for lamassu-admin failed"
+openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:8081" -keyout /root/lamassu-admin.key  -out /root/lamassu-admin.crt >> $debug 2>&1 || fail "Generating a certificate for lamassu-admin failed"
 
-openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:3000" -keyout /root/lamassu-server.key -out /root/lamassu-server.crt >> $debug 2>&1
-[ $? -ne 0 ] && fail "Generating a certificate for lamassu-server failed"
+openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:3000" -keyout /root/lamassu-server.key -out /root/lamassu-server.crt >> $debug 2>&1 || fail "Generating a certificate for lamassu-server failed"
 
 chmod 600 /root/{*.key,*.crt}
 
 echo "Starting Lamassu services..."
-start lamassu-admin >> $debug 2>&1
-[ $? -ne 0 ] && fail "Starting lamassu-admin failed"
-
-start lamassu-server >> $debug 2>&1
-[ $? -ne 0 ] && fail "Starting lamassu-server failed"
+if [ "$service" == "upstart" ]; then
+	start lamassu-admin >> $debug 2>&1 || fail "Starting lamassu-admin failed"
+	start lamassu-server >> $debug 2>&1 || fail "Starting lamassu-server failed"
+elif [ "$service" == "debian_sysv-rc" ]; then
+	invoke-rc.d lamassu-admin start >> $debug 2>&1 || fail "Starting lamassu-admin failed"
+	invoke-rc.d lamassu-server start >> $debug 2>&1 || fail "Starting lamassu-server failed"
+fi
 
 echo
 echo "Done! Now it's time to configure Lamassu stack."
