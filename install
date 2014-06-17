@@ -32,8 +32,8 @@ function initscript() {
 #!/bin/sh
 ### BEGIN INIT INFO
 # Provides:          $package
-# Required-Start:    \$remote_fs
-# Required-Stop:     \$remote_fs
+# Required-Start:    \$remote_fs \$network postgresql
+# Required-Stop:     \$remote_fs \$network postgresql
 # Default-Start:     2 3 4 5
 # Default-Stop:      0 1 6
 # Short-Description: $package
@@ -48,6 +48,7 @@ export LAMASSU_ENV=production
 #export LAMASSU_ENV=debug
 #CLOSE=--no-close
 PIDFILE=/var/run/$package.pid
+PATH=\$PATH:/usr/local/bin
 DAEMON=/usr/local/bin/$package
 DAEMON_OPTS="--key $userhome/$package.key --cert $userhome/$package.crt"
 NAME=node
