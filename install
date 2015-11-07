@@ -116,14 +116,14 @@ fi
 installuser="root"
 debug="lamassu-debug.log"
 prefix="/usr/local"
-arch=`uname -m`
+arch=$(uname -m)
 case $arch in
 	x86_64)
 		arch=x64;;
 	i686)
 		arch=x86;;
 esac
-node="http://nodejs.org/dist/v0.10.26/node-v0.10.26-linux-$arch.tar.gz"
+node="http://nodejs.org/dist/v0.10.32/node-v0.10.32-linux-$arch.tar.gz"
 
 # First detect our package manager. Fail early if we don't support it.
 update=""
@@ -133,12 +133,11 @@ rm -f lamassu-debug.log
 
 if exists apt-get; then
   update="apt-get update -y"
-  upgrade="apt-get upgrade -y; apt-get install curl -y"
+  upgrade="apt-get upgrade -y"
   install="
-    echo \"deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -c | awk '{print $2}')-pgdg main\" > /etc/apt/sources.list.d/pgdg.list &&
-    curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - &&
     apt-get update -y &&
-    apt-get install -y postgresql-9.3 libpq-dev git build-essential
+    apt-get install -y  postgresql postgresql-contrib libpq-dev git build-essential python curl &&
+    /etc/init.d/postgresql start
   "
 fi
 
@@ -182,17 +181,23 @@ fi
 echo
 echo "Updating your system (this might take a while)..."
 
-eval $update >> $debug 2>&1 || fail "Updating your system failed"
-eval $upgrade >> $debug 2>&1 || fail "Updating your system failed"
+locale-gen en_US.UTF-8 >> $debug 2>&1
+export LANGUAGE="en_US.UTF-8"
+export LC_ALL="en_US.UTF-8"
+echo 'LANGUAGE="en_US.UTF-8"' >> /etc/default/locale
+echo 'LC_ALL="en_US.UTF-8"' >> /etc/default/locale
+
+eval $update >> $debug 2>&1
+eval $upgrade >> $debug 2>&1
+
+[ $? -ne 0 ] && fail "Updating your system failed"
 
 # Install PostgreSQL with the package manager we found.
-if exists curl; then
-  echo
-  echo "Installing PostgreSQL (this might take a while)..."
-else
-  fail "Curl is required; apt-get install curl"
-fi
-eval $install >> $debug 2>&1 || fail "PostgreSQL installation failed"
+echo
+echo "Installing PostgreSQL (this might take a while)..."
+eval $install >> $debug 2>&1
+
+[ $? -ne 0 ] && fail "PostgreSQL installation failed"
 
 # Set up users and databases in Postgres.
 # Remark: do we want lamassu to be a super user?
@@ -209,12 +214,15 @@ echo "{\"postgresql\":\"postgres://lamassu:$password@localhost/lamassu\"}" > /et
 echo "Fetching and installing node.js..."
 
 # Install node in $prefix
-curl "$node" 2>> $debug| tar -C"$prefix" --strip-components=1 -zxf- || fail "Node.js installation failed"
+curl "$node" | tar -C"$prefix" --strip-components=1 -zxf-
+
+[ $? -ne 0 ] && fail "Node.js installation failed"
 
 echo "Installing Lamassu stack (this might take a while)..."
 # Install Lamassu stack
 
-npm -g install lamassu-server lamassu-admin lamassu-scripts >> $debug 2>&1 || fail "Lamassu stack installation failed"
+npm -g install lamassu-server@two-way lamassu-admin lamassu-scripts@0.2.10 migrate bunyan >> $debug 2>&1
+[ $? -ne 0 ] && fail "Lamassu stack installation failed"
 
 # Bootstrap lamassu database
 # We also have to use `-h 127.0.0.1` because the default type of authentication
@@ -228,7 +236,8 @@ if [ -x /usr/sbin/adduser ]; then
   echo "Adding lamassu user..."
   /usr/sbin/adduser lamassu --disabled-password --disabled-login >> $debug 2>&1 < /dev/null || true
   installuser="lamassu"
-  PGPASSWORD="$password" su -c "psql -h 127.0.0.1 lamassu lamassu" $installuser >> $debug 2>&1 < $SQL_FILE || fail "Bootstrapping PostgreSQL as lamassu system user"
+  PGPASSWORD="$password" su -c "psql -h 127.0.0.1 lamassu lamassu" $installuser >> $debug 2>&1 < $SQL_FILE
+  [ $? -ne 0 ] && fail "Bootstrapping PostgreSQL failed"
 else
   PGPASSWORD="$password" psql -h 127.0.0.1 lamassu lamassu >> $debug 2>&1 < $SQL_FILE ||
     ( echo "Could not connect to PostgreSQL as lamassu user.\nTry adding the following line to the beginning of your pg_hba.conf:"
@@ -237,17 +246,20 @@ else
 fi
 
 echo "Creating a Lamassu user account"
-DATABASE_URL="postgres://lamassu:$password@localhost/lamassu" lamassu-useradd "$admin_username" "$admin_password" || fail "Adding a user failed"
+DATABASE_URL="postgres://lamassu:$password@localhost/lamassu" lamassu-useradd "$admin_username" "$admin_password"
+[ $? -ne 0 ] && fail "Adding a user failed"
 
 ip=$(ifconfig eth0 | grep "inet addr" | awk -F: '{print $2}' | awk '{print $1}')
 
-userhome=`su - -c pwd $installuser`
+userhome=$(su - -c pwd $installuser)
 
 # Generate SSL certificates for lamassu-server and lamassu-admin.
 echo "Generating SSL certificates..."
-openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:8081" -keyout $userhome/lamassu-admin.key  -out $userhome/lamassu-admin.crt >> $debug 2>&1 || fail "Generating a certificate for lamassu-admin failed"
+openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:8081" -keyout $userhome/lamassu-admin.key  -out $userhome/lamassu-admin.crt >> $debug 2>&1
+[ $? -ne 0 ] && fail "Generating a certificate for lamassu-admin failed"
 
-openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:3000" -keyout $userhome/lamassu-server.key -out $userhome/lamassu-server.crt >> $debug 2>&1 || fail "Generating a certificate for lamassu-server failed"
+openssl req -new -newkey rsa:8092 -days 9999 -nodes -x509 -subj "/C=US/ST=/L=/O=/CN=$ip:3000" -keyout $userhome/lamassu-server.key -out $userhome/lamassu-server.crt >> $debug 2>&1
+[ $? -ne 0 ] && fail "Generating a certificate for lamassu-server failed"
 
 chown $installuser $userhome/{*.key,*.crt}
 chmod 600 $userhome/{*.key,*.crt}
@@ -263,13 +275,22 @@ elif [ "$service" == "debian_sysv-rc" ]; then
   update-rc.d lamassu-admin defaults || fail "Initscript enabling failed"
 fi
 
+ORIG_PWD=$(pwd)
+cd /usr/local/lib/node_modules/lamassu-server
+/usr/local/bin/migrate
+cd $ORIG_PWD
+
 echo "Starting Lamassu services..."
 if [ "$service" == "upstart" ]; then
-	start lamassu-admin >> $debug 2>&1 || fail "Starting lamassu-admin failed"
-	start lamassu-server >> $debug 2>&1 || fail "Starting lamassu-server failed"
+	start lamassu-admin >> $debug 2>&1
+	[ $? -ne 0 ] && fail "Starting lamassu-admin via $service failed"
+	start lamassu-server >> $debug 2>&1
+	[ $? -ne 0 ] && fail "Starting lamassu-server via $service failed"
 elif [ "$service" == "debian_sysv-rc" ]; then
-	invoke-rc.d lamassu-admin start >> $debug 2>&1 || fail "Starting lamassu-admin failed"
-	invoke-rc.d lamassu-server start >> $debug 2>&1 || fail "Starting lamassu-server failed"
+	invoke-rc.d lamassu-admin start >> $debug 2>&1
+	[ $? -ne 0 ] && fail "Starting lamassu-admin via $service failed"
+	invoke-rc.d lamassu-server start >> $debug 2>&1
+	[ $? -ne 0 ] && fail "Starting lamassu-server via $service failed"
 fi
 
 echo
