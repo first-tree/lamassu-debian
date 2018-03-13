@@ -1,4 +1,4 @@
-Lamassu install script for Debian and Ubuntu
+Lamassu install script for Ubuntu 14.04
 ============================================
 
 This is a modified install script for the Lamassu administration and backend
@@ -8,6 +8,6 @@ The upstream script is for Ubuntu 14.04 only and is located [here](https://raw.g
 
 And documented in this [page](http://support.lamassu.is/support/solutions/articles/1000068000--start-here-lamassu-admin-installation).
 
-This modified script supports both Debian and Ubuntu machines.  Additionally,
+This modified script supports Ubuntu 14.04 machines.  Additionally,
 it runs the server processes as unprivileged user accounts instead of as root,
 and applies several other fixes to make it more robust.
