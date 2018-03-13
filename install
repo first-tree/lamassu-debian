@@ -221,7 +221,7 @@ curl "$node" | tar -C"$prefix" --strip-components=1 -zxf-
 echo "Installing Lamassu stack (this might take a while)..."
 # Install Lamassu stack
 
-npm -g install lamassu-server@two-way lamassu-admin lamassu-scripts@0.2.10 migrate bunyan >> $debug 2>&1
+sudo npm -g install lamassu/lamassu-server#two-way lamassu-admin lamassu-scripts@0.2.10 migrate bunyan >> $debug 2>&1
 [ $? -ne 0 ] && fail "Lamassu stack installation failed"
 
 # Bootstrap lamassu database
